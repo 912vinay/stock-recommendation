@@ -55,6 +55,30 @@ def _score_buy_row(row: pd.Series, cfg: ScreenerConfig) -> float:
     return score
 
 
+def _normalize_price_frame(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    # If MultiIndex columns, try to select the single ticker layer and leave OHLCV at single level
+    if isinstance(df.columns, pd.MultiIndex):
+        level0 = list(df.columns.get_level_values(0))
+        level1 = list(df.columns.get_level_values(1))
+        try:
+            if ticker in level0:
+                df = df[ticker]
+            elif ticker in level1:
+                df = df.xs(ticker, axis=1, level=1)
+            elif {"Open", "High", "Low", "Close", "Adj Close", "Volume"}.issubset(set(level0)):
+                df.columns = df.columns.get_level_values(0)
+                df = df[[c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df.columns]]
+            elif {"Open", "High", "Low", "Close", "Adj Close", "Volume"}.issubset(set(level1)):
+                df.columns = df.columns.get_level_values(1)
+                df = df[[c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df.columns]]
+        except Exception:
+            # If anything goes wrong, keep original and let downstream safety handle
+            pass
+    return df
+
+
 def _download_history_per_symbol(symbols: List[str], cfg: ScreenerConfig) -> Dict[str, pd.DataFrame]:
     results: Dict[str, pd.DataFrame] = {}
     for sym in symbols:
@@ -63,11 +87,12 @@ def _download_history_per_symbol(symbols: List[str], cfg: ScreenerConfig) -> Dic
                 tickers=sym,
                 period=f"{cfg.run.lookback_days}d",
                 interval="1d",
-                group_by="ticker",
+                group_by="column",
                 auto_adjust=False,
                 threads=False,
                 progress=False,
             )
+            df = _normalize_price_frame(df, sym)
             if isinstance(df, pd.DataFrame) and not df.empty:
                 results[sym] = df.copy()
         except Exception:
@@ -89,7 +114,7 @@ def run_screen(symbols: List[str], cfg: ScreenerConfig, for_buy: bool = True) ->
                     tickers=batch,
                     period=f"{cfg.run.lookback_days}d",
                     interval="1d",
-                    group_by="ticker",
+                    group_by="column",
                     auto_adjust=False,
                     threads=True,
                     progress=False,
@@ -97,22 +122,26 @@ def run_screen(symbols: List[str], cfg: ScreenerConfig, for_buy: bool = True) ->
             except Exception:
                 hist = pd.DataFrame()
             if isinstance(hist, pd.DataFrame) and not hist.empty:
-                if set(["Open", "High", "Low", "Close", "Adj Close", "Volume"]).issubset(hist.columns):
-                    hist_all[batch[0]] = hist.copy()
-                else:
-                    for t in batch:
-                        try:
-                            df_t = hist[t].copy()
+                # Normalize each ticker view
+                for t in batch:
+                    try:
+                        df_t = hist[t] if isinstance(hist.columns, pd.MultiIndex) and t in hist.columns.get_level_values(1) else hist
+                        df_t = _normalize_price_frame(df_t, t)
+                        if isinstance(df_t, pd.DataFrame) and not df_t.empty:
                             hist_all[t] = df_t
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
 
     # Build technical-only rows first
     tech_rows: List[Dict] = []
     for yticker in symbols:
         base: Dict[str, float | int | str | bool | None] = {"ticker": yticker}
         tech_df = hist_all.get(yticker, pd.DataFrame())
-        tech = compute_technical_snapshot(tech_df) if isinstance(tech_df, pd.DataFrame) and not tech_df.empty else {}
+        tech = {}
+        try:
+            tech = compute_technical_snapshot(tech_df) if isinstance(tech_df, pd.DataFrame) and not tech_df.empty else {}
+        except Exception:
+            tech = {}
         base.update(tech)
         for key in [
             "close","high_52w","low_52w","sma50","sma200","rsi14","vol","vol50","price_above_200d","sma50_above_200d","volume_mult_vs_50d",
